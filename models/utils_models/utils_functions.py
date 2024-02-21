@@ -7,10 +7,26 @@ import numpy as np
 import pandas as pd
 from gurobipy import LinExpr
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from tabulate import tabulate
 import time
 import sys
+from gurobipy import GRB
+from scipy.sparse import issparse
+from collections import defaultdict
+
+
+def nested_dict():
+    """
+    Create a nested defaultdict.
+
+    This function returns a nested defaultdict, which is a dictionary that allows an arbitrary number of levels
+    of nesting. It simplifies the process of creating and working with nested dictionaries by automatically
+    creating inner dictionaries as needed.
+
+    Returns:
+    - defaultdict: A nested defaultdict object that allows arbitrary levels of nesting.
+    """
+    return defaultdict(nested_dict)
 
 
 def create_original_model(n_variables, n_constraints):
@@ -93,13 +109,20 @@ def get_model_matrices(model):
     # Access the sense of optimization
     of_sense = model.ModelSense
 
+    # get the constant in the of
+    of = model.getObjective()
+    co = of.getConstant()
+
     # Access the sense of each constraint
     cons_senses = [constr.Sense for constr in model.getConstrs()]
 
-    return A, b, c, lb, ub, of_sense, cons_senses
+    # Getting the variable names
+    variable_names = [var.VarName for var in model.getVars()]
+
+    return A, b, c, co, lb, ub, of_sense, cons_senses, variable_names
 
 
-def save_json(A, b, c, lb, ub, of_sense, cons_senses, save_path):
+def save_json(A, b, c, lb, ub, of_sense, cons_senses, save_path, co=0, variable_names=None):
     """
     Save matrices and data structures as JSON files, including the sense of optimization and constraints.
 
@@ -112,20 +135,28 @@ def save_json(A, b, c, lb, ub, of_sense, cons_senses, save_path):
     - of_sense (int): Sense of optimization (1 for minimize, -1 for maximize).
     - cons_senses (list): List of senses for each constraint.
     - save_path (str): Path to save JSON files.
+    - co (float, optional): constant of objective function. Default is 0
+    - variable_names (list, optional): Names of the decision variables. If None, defaults to x1, x2, ...
 
     The data includes the constraint matrix A, vectors b, c, lower bounds lb, upper bounds ub,
     the sense of optimization, and the senses of each constraint.
     """
+
+    # Generate default variable names if not provided
+    if variable_names is None:
+        variable_names = [f'x{i + 1}' for i in range(A.shape[1])]
 
     # Create a dictionary to store the data
     data_dict = {
         'A': A.toarray(),  # Convert csr_matrix to dense array for JSON
         'b': b,
         'c': c,
+        'co': co,
         'lb': lb,
         'ub': ub,
         'of_sense': of_sense,
-        'cons_senses': cons_senses
+        'cons_senses': cons_senses,
+        'variable_names': variable_names
     }
 
     # Ensure the save path exists
@@ -135,11 +166,8 @@ def save_json(A, b, c, lb, ub, of_sense, cons_senses, save_path):
     for name, data in data_dict.items():
         file_name = os.path.join(save_path, f'{name}.json')
 
-        if isinstance(data, list):
-            with open(file_name, 'w') as file:
-                json.dump(data, file)
-        elif isinstance(data, np.ndarray):
-            data_list = data.tolist()
+        if isinstance(data, list) or isinstance(data, np.ndarray):
+            data_list = data if isinstance(data, list) else data.tolist()
             with open(file_name, 'w') as file:
                 json.dump(data_list, file)
         else:
@@ -160,44 +188,58 @@ def build_model_from_json(data_path):
     """
 
     # Define the file names for JSON files
-    file_names = ['A.json', 'b.json', 'c.json', 'lb.json', 'ub.json', 'of_sense.json', 'cons_senses.json']
+    file_names = ['A.json', 'b.json', 'c.json', 'lb.json', 'ub.json', 'of_sense.json', 'cons_senses.json', 'co.json',
+                  'variable_names.json']
 
     # Initialize data variables
-    A, b, c, lb, ub, of_sense, cons_senses = None, None, None, None, None, None, None
+    A, b, c, lb, ub, of_sense, cons_senses, co, variable_names = None, None, None, None, None, None, None, None, None
 
     # Load data from JSON files
     for file_name in file_names:
         file_path = os.path.join(data_path, file_name)
-        with open(file_path, 'r') as file:
-            data = json.load(file)
 
-            if file_name == 'A.json':
-                A = sp.csr_matrix(np.array(data))
-            elif file_name == 'b.json':
-                b = np.array(data)
-            elif file_name == 'c.json':
-                c = np.array(data)
-            elif file_name == 'lb.json':
-                lb = np.array(data)
-            elif file_name == 'ub.json':
-                ub = np.array(data)
-            elif file_name == 'of_sense.json':
-                of_sense = data
-            elif file_name == 'cons_senses.json':
-                cons_senses = data
+        try:
+            with open(file_path, 'r') as file:
+                data = json.load(file)
+
+                if file_name == 'A.json':
+                    A = sp.csr_matrix(np.array(data))
+                elif file_name == 'b.json':
+                    b = np.array(data)
+                elif file_name == 'c.json':
+                    c = np.array(data)
+                elif file_name == 'lb.json':
+                    lb = np.array(data)
+                elif file_name == 'ub.json':
+                    ub = np.array(data)
+                elif file_name == 'of_sense.json':
+                    of_sense = data
+                elif file_name == 'cons_senses.json':
+                    cons_senses = data
+                elif file_name == 'co.json':
+                    co = data
+                elif file_name == 'variable_names.json':
+                    variable_names = data
+        except FileNotFoundError:
+            # Skip if the file does not exist
+            continue
 
     # Create a Gurobi model and add variables
     num_variables = len(c)
     model = gp.Model()
 
-    # Add variables with names starting from x1
+    # Add variables with provided names or default to x1, x2, etc.
     x = []
     for i in range(num_variables):
-        x.append(model.addVar(lb=lb[i], ub=ub[i], name=f'x{i + 1}'))
+        var_name = variable_names[i] if variable_names is not None and i < len(variable_names) else f'x{i + 1}'
+        x.append(model.addVar(lb=lb[i], ub=ub[i], name=var_name))
     model.update()
 
     # Set objective function
     objective_expr = gp.quicksum(c[i] * x[i] for i in range(num_variables))
+    if co is not None:
+        objective_expr += co
+
     model.setObjective(objective_expr, of_sense)
 
     # Add constraints
@@ -208,9 +250,9 @@ def build_model_from_json(data_path):
         coefficients = A.data[start:end]
 
         constraint_expr = gp.quicksum(coefficients[j] * x[variables[j]] for j in range(len(variables)))
-        if cons_senses[i] == '<':
+        if cons_senses[i] == '<' or cons_senses[i] == '<=':
             model.addConstr(constraint_expr <= b[i], name=f'constraint_{i}')
-        elif cons_senses[i] == '>':
+        elif cons_senses[i] == '>' or cons_senses[i] == '>=':
             model.addConstr(constraint_expr >= b[i], name=f'constraint_{i}')
         elif cons_senses[i] == '=':
             model.addConstr(constraint_expr == b[i], name=f'constraint_{i}')
@@ -333,7 +375,7 @@ def sparsification_sensitivity_analysis(sens_data, model, params, model_to_use='
       - dv is a list of decision variable values for each threshold.
     """
 
-    A, b, c, lb, ub, of_sense, cons_senses = get_model_matrices(model)
+    A, b, c, co, lb, ub, of_sense, cons_senses, variable_names = get_model_matrices(model)
 
     # Calculate normalized A
     A_norm, _ = normalize_features(A)
@@ -599,7 +641,7 @@ def constraint_reduction(model, threshold, path):
     """
 
     # Extract matrices and vectors from the model
-    A, b, c, lb, ub, of_sense, cons_senses = get_model_matrices(model)
+    A, b, c, co, lb, ub, of_sense, cons_senses, variable_names = get_model_matrices(model)
 
     # Normalize A
     A_norm, _ = normalize_features(A)
@@ -638,7 +680,7 @@ def constraint_distance_reduction_sensitivity_analysis(sens_data, model, params,
       - dv is a list of decision variable values for each threshold.
     """
 
-    A, b, c, lb, ub, of_sense, cons_senses = get_model_matrices(model)
+    A, b, c, co, lb, ub, of_sense, cons_senses, variable_names = get_model_matrices(model)
 
     # Calculate normalized A
     A_norm, _ = normalize_features(A)
@@ -726,7 +768,7 @@ def measuring_constraint_infeasibility(target_model, decisions):
     """
 
     # Extract A, b and c from the target model
-    A, b, c, _, _, _, _ = get_model_matrices(target_model)
+    A, b, c, _, _, _, _, _, _ = get_model_matrices(target_model)
     cost = np.array(c)
 
     # Initialize arrays to store violations
@@ -765,7 +807,7 @@ def pre_processing_model(model):
     # Clone the original model to avoid altering it directly
     pre_processed_model = model.copy()
 
-    # Find the highest index among existing decision variables
+    # Find the decision variables
     existing_vars = pre_processed_model.getVars()
 
     # Handling variable bounds
@@ -866,31 +908,26 @@ def print_model_in_mathematical_format(model):
     # Print variable bounds (if they are not default 0 and infinity)
     bounds = 'Bounds\n'
     for var in model.getVars():
-        lb = '' if var.LB == 0 else f'{var.LB} <= '
-        ub = '' if var.UB == gp.GRB.INFINITY else f' <= {var.UB}'
-        if lb != '' or ub != '':
-            bounds += lb + var.VarName + ub + '\n'
+        lb = '-inf' if var.LB <= -gp.GRB.INFINITY else str(var.LB)
+        ub = '+inf' if var.UB >= gp.GRB.INFINITY else str(var.UB)
+        bounds += f'{lb} <= {var.VarName} <= {ub}\n'
 
     print(objective)
     print(constraints)
-    if bounds.strip() != 'Bounds':
-        print(bounds)
+    print(bounds)
 
 
 def quality_check(original_primal_bp, original_primal, created_primal, created_dual, tolerance=1e-6):
     """
-    Performs a quality check on the provided optimization models, including a normalized model.
-
-    This function compares the objective function values and decision variables of the primal models
-    (original_primal_bp, original_primal, created_primal, and created_primal_norm) and checks if the
-    objective function value of the created_dual model matches that of the original_primal_bp model.
+    Performs a quality check on the provided optimization models, including a canonical model.
 
     Parameters:
     - original_primal_bp: The primal model before preprocessing.
     - original_primal: The primal model after preprocessing.
     - created_primal: The primal model created from matrices.
     - created_dual: The dual model created from matrices.
-    - created_primal_norm: The normalized primal model.
+    - canonical_primal: The canonical form of the primal model.
+    - track_elements: A dictionary tracking the changes made to variables and constraints in the canonical model.
     - tolerance: A float representing the tolerance for comparison (default is 1e-6).
 
     Raises:
@@ -899,25 +936,43 @@ def quality_check(original_primal_bp, original_primal, created_primal, created_d
     Returns:
     - None
     """
-
-    # Compare objective values of the primal models
+    # Compare objective values of the primal models including the canonical model
     primal_models = [original_primal_bp, original_primal, created_primal]
+    primal_models_names = ['original_primal_bp', 'original_primal', 'created_primal', 'canonical_primal']
+
     for model1 in primal_models:
         for model2 in primal_models:
             if abs(model1.objVal - model2.objVal) > tolerance:
                 raise ValueError(
                     f"Quality check failed: Objective function values differ between {model1.ModelName} and {model2.ModelName}")
 
+    # Building the dictionary of decision variables
+    decision_vars = {}
+    for ind, model in enumerate(primal_models):
+        decision_vars[primal_models_names[ind]] = {}
+        for var in model.getVars():
+            if var.VarName.endswith("_pos"):
+                original_var_name = var.VarName[:-4]  # Removing '_pos' to get the original variable name
+                var_neg = model.getVarByName(f"{original_var_name}_neg")
+                decision_vars[primal_models_names[ind]][original_var_name] = var.x - var_neg.x
+            elif not var.VarName.endswith("_neg"):
+                decision_vars[primal_models_names[ind]][var.VarName] = var.x
+
+    # Comparing decision variable values across models
     primal_created_models = [original_primal, created_primal]
-    # Compare decision variables of the primal models
+    primal_created_models_names = ['original_primal', 'created_primal', 'canonical_primal']
+
     for i in range(len(primal_created_models)):
         for j in range(i + 1, len(primal_created_models)):
-            model1_vars = primal_created_models[i].getVars()
-            model2_vars = primal_created_models[j].getVars()
-            for var1, var2 in zip(model1_vars, model2_vars):
-                if abs(var1.x - var2.x) > tolerance:
-                    raise ValueError(
-                        f"Quality check failed: Decision variable {var1.VarName} differs between {primal_models[i].ModelName} and {primal_models[j].ModelName}")
+            model1_name = primal_created_models_names[i]
+            model2_name = primal_created_models_names[j]
+            for var_name in decision_vars[model1_name]:
+                if var_name in decision_vars[model2_name]:
+                    var1_value = decision_vars[model1_name][var_name]
+                    var2_value = decision_vars[model2_name][var_name]
+                    if abs(var1_value - var2_value) > tolerance:
+                        raise ValueError(
+                            f"Quality check failed: Decision variable {var_name} differs between {model1_name} and {model2_name}")
 
     # Compare objective value of created_dual and original_primal_bp
     if abs(created_dual.objVal - original_primal_bp.objVal) > tolerance:
@@ -938,7 +993,7 @@ def sparsification_test(original_model, config, current_matrices_path):
     None: The function prints the results.
     """
     # Extract matrices and vectors from the original model
-    A, b, c, lb, ub, of_sense, cons_senses = get_model_matrices(original_model)
+    A, b, c, co, lb, ub, of_sense, cons_senses, variable_names = get_model_matrices(original_model)
     A_norm, A_scaler = normalize_features(A)
 
     # Apply matrix sparsification
@@ -1115,3 +1170,364 @@ def detailed_info_models(original_primal_bp, original_primal, created_primal, cr
         for var in created_dual.getVars():
             if var.x != 0:
                 print(f"{var.VarName} =", var.x)
+
+
+def rhs_sensitivity(model):
+    """
+    Perform Right-Hand Side (RHS) sensitivity analysis on a Gurobi model.
+
+    This function takes a Gurobi model as input, which is assumed to have been solved to optimality.
+    It returns two vectors: 'allowable_decrease' and 'allowable_increase', which represent the amount by which
+    the RHS of each constraint can be decreased or increased without altering the optimal basis of the solution.
+
+    Args:
+    model (gurobipy.Model): The Gurobi model for which RHS sensitivity analysis is to be performed.
+
+    Returns:
+    Tuple[List[float], List[float]]: Two lists containing the allowable decreases and increases in the RHS of each constraint.
+    """
+
+    allowable_decrease = []
+    allowable_increase = []
+
+    for constraint in model.getConstrs():
+        # Append the allowable decrease and increase for each constraint
+        allowable_decrease.append(constraint.SARHSLow)
+        allowable_increase.append(constraint.SARHSUp)
+
+    return allowable_decrease, allowable_increase
+
+
+def cost_function_sensitivity(model):
+    """
+    Perform cost coefficient sensitivity analysis on a linear programming model.
+
+    Args:
+    model: The linear programming model, already solved to optimality.
+
+    Returns:
+    A dictionary containing the allowable increase and decrease for each variable's cost coefficient.
+    """
+
+    allowable_decrease = []
+    allowable_increase = []
+
+    # Iterate over all decision variables in the model
+    for var in model.getVars():
+        reduced_cost = var.RC
+
+        if model.ModelSense == 1:
+            # For minimization problems
+            allowable_decrease.append(float('inf') if reduced_cost <= 0 else reduced_cost)
+            allowable_increase.append(float('inf') if reduced_cost >= 0 else -reduced_cost)
+        else:
+            # For maximization problems
+            allowable_decrease.append(float('inf') if reduced_cost >= 0 else -reduced_cost)
+            allowable_increase.append(float('inf') if reduced_cost <= 0 else reduced_cost)
+
+    return allowable_decrease, allowable_increase
+
+
+def dict2json(dictionary, file_path):
+    """
+    Converts a dictionary to a JSON file, handling NumPy ndarray objects.
+    Saves the JSON to the specified file path and logs the action.
+
+    Parameters:
+        dictionary (dict): The dictionary to be converted and saved.
+        file_path (str): The path to save the JSON file.
+    """
+
+    # Function to convert ndarrays to lists
+    def convert_ndarray(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError("Object of type '%s' is not JSON serializable" % type(obj).__name__)
+
+    # Convert and save as JSON
+    with open(file_path, 'w') as file:
+        json.dump(dictionary, file, default=convert_ndarray, indent=4)
+
+
+def get_constraint_expression(model, i):
+    """
+    Retrieves the i-th constraint from the Gurobi model and returns it as a string expression.
+
+    Parameters:
+    model (gurobipy.Model): The Gurobi model from which to extract the constraint.
+    i (int): The index of the constraint to be retrieved.
+
+    Returns:
+    str: The constraint expressed in the form 'LHS operation RHS'.
+         For example, '2x + 3y <= 5'.
+
+    Raises:
+    IndexError: If the index i is out of the range of the model's constraints.
+    """
+    # Ensure the index is within the range of constraints
+    if i < 0 or i >= model.NumConstrs:
+        raise IndexError("Constraint index is out of range.")
+
+    # Retrieve the i-th constraint
+    i_th_constraint = model.getConstrs()[i]
+
+    # Get the linear expression (LHS) of the constraint
+    lhs_expression = model.getRow(i_th_constraint)
+
+    # Get the sense (equality/inequality) of the constraint
+    constraint_sense = i_th_constraint.Sense
+
+    # Get the RHS of the constraint
+    rhs_value = i_th_constraint.RHS
+
+    # Convert the sense symbol to a readable format
+    sense_symbol = {
+        GRB.LESS_EQUAL: "<=",
+        GRB.GREATER_EQUAL: ">=",
+        GRB.EQUAL: "="
+    }.get(constraint_sense, "?")
+
+    # Construct and return the full constraint expression
+    return f"{lhs_expression} {sense_symbol} {rhs_value}"
+
+
+def canonical_form(model, minOption=False):
+    """
+    Converts a given Gurobi model into its canonical form.
+
+    In the canonical form, all variables are non-negative, and constraints are formatted uniformly as
+    either <= or >= depending on the problem being a maximization or minimization problem. This
+    function also handles bounded variables and equality constraints by converting them into the
+    appropriate inequality form.
+
+    Args:
+    - model: The Gurobi model to be converted.
+    - minOption: If True, ensures the optimization problem is set to minimization.
+
+    Returns:
+    - canonical_model: The converted model in canonical form.
+    - track_elements: A dictionary tracking the changes made to variables and constraints
+      (original or created).
+    """
+
+    # Initialize tracking dictionaries for variables and constraints
+    track_elements = {'variables': {}, 'constraints': {}}
+
+    # Clone the model to avoid changing the original
+    canonical_model = model.copy()
+
+    # Set the model sense to minimization if minOption is True
+    if minOption and canonical_model.ModelSense != 1:
+        # Multiply the objective function by -1 to switch from maximization to minimization
+        canonical_model.setObjective(-1 * canonical_model.getObjective(), gp.GRB.MINIMIZE)
+
+    # Handle variable bounds and convert them into constraints
+    for var in canonical_model.getVars():
+        lower_bound = var.LB
+        upper_bound = var.UB
+
+        # Handling lower bounds
+        if lower_bound > -gp.GRB.INFINITY and lower_bound != 0:
+            constr_name = f"{var.VarName}_lb"
+            if canonical_model.ModelSense == 1:  # Minimization
+                canonical_model.addConstr(var >= lower_bound, name=constr_name)
+            else:  # Maximization
+                canonical_model.addConstr(-var <= -lower_bound, name=constr_name)
+            var.LB = -gp.GRB.INFINITY
+            track_elements['constraints'][constr_name] = 'created'
+
+        # Handling upper bounds
+        if upper_bound < gp.GRB.INFINITY and upper_bound != 0:
+            constr_name = f"{var.VarName}_ub"
+            if canonical_model.ModelSense == 1:  # Minimization
+                canonical_model.addConstr(-var >= -upper_bound, name=constr_name)
+            else:  # Maximization
+                canonical_model.addConstr(var <= upper_bound, name=constr_name)
+            var.UB = gp.GRB.INFINITY
+            track_elements['constraints'][constr_name] = 'created'
+
+        track_elements['variables'][var.VarName] = 'original'
+
+    canonical_model.update()
+
+    # Handle equality constraints by converting them into two inequalities
+    for constr in canonical_model.getConstrs():
+        if constr.Sense == gp.GRB.EQUAL:
+            lhs_expr = canonical_model.getRow(constr)
+            rhs_value = constr.RHS
+            canonical_model.addConstr(lhs_expr >= rhs_value, name=constr.ConstrName + "_geq")
+            canonical_model.addConstr(lhs_expr <= rhs_value, name=constr.ConstrName + "_leq")
+            track_elements['constraints'][constr.ConstrName + "_geq"] = 'created'
+            track_elements['constraints'][constr.ConstrName + "_leq"] = 'created'
+            canonical_model.remove(constr)
+            track_elements['constraints'][constr.ConstrName] = 'removed'
+
+    canonical_model.update()
+
+    # Uniformize constraints to <= for maximization and >= for minimization
+    for constr in list(canonical_model.getConstrs()):  # Convert to list to avoid modification during iteration
+        lhs_expr = canonical_model.getRow(constr)
+        rhs_value = constr.RHS
+
+        if canonical_model.ModelSense == -1 and constr.Sense == gp.GRB.GREATER_EQUAL:  # Maximization
+            canonical_model.addConstr(-lhs_expr <= -rhs_value, name=constr.ConstrName + "_leq")
+            canonical_model.remove(constr)
+            track_elements['constraints'][constr.ConstrName + "_leq"] = 'created'
+
+        elif canonical_model.ModelSense == 1 and constr.Sense == gp.GRB.LESS_EQUAL:  # Minimization
+            canonical_model.addConstr(-lhs_expr >= -rhs_value, name=constr.ConstrName + "_geq")
+            canonical_model.remove(constr)
+            track_elements['constraints'][constr.ConstrName + "_geq"] = 'created'
+
+    canonical_model.update()
+
+    # Transform variables with negative lower bounds to non-negative
+    for var in list(canonical_model.getVars()):
+        if var.LB < 0:
+            # Create two auxiliary non-negative variables
+            x_pos = canonical_model.addVar(lb=0, name=f"{var.VarName}_pos")
+            x_neg = canonical_model.addVar(lb=0, name=f"{var.VarName}_neg")
+            canonical_model.update()
+
+            # Check if the variable is in the objective function and update it
+            of = canonical_model.getObjective()
+            variables_of = [of.getVar(i) for i in range(of.size())]
+            for ind_o in range(len(variables_of)):
+                if var.VarName == variables_of[ind_o].VarName:
+                    obj_coeff = canonical_model.getObjective().getCoeff(0)
+                    new_obj_expr = canonical_model.getObjective() + obj_coeff * (x_pos - x_neg - var)
+                canonical_model.setObjective(new_obj_expr)
+
+            # Replace original variable in all constraints
+            for constr in list(canonical_model.getConstrs()):
+                lhs_expr = canonical_model.getRow(constr)
+                variables = [lhs_expr.getVar(i) for i in range(lhs_expr.size())]
+
+                for ind in range(len(variables)):
+                    if var.VarName == variables[ind].VarName:
+                        var_coeff = lhs_expr.getCoeff(ind)
+                        # Create a new linear expression
+                        new_expr = gp.LinExpr(lhs_expr)
+                        new_expr.addTerms([var_coeff, -var_coeff], [x_pos, x_neg])
+
+                        # Update the constraint with the new expression
+                        new_constr_name = f"{constr.ConstrName}_mod"
+                        if constr.Sense == gp.GRB.LESS_EQUAL:
+                            canonical_model.addConstr(new_expr <= constr.RHS, name=new_constr_name)
+                        elif constr.Sense == gp.GRB.GREATER_EQUAL:
+                            canonical_model.addConstr(new_expr >= constr.RHS, name=new_constr_name)
+                        elif constr.Sense == gp.GRB.EQUAL:
+                            canonical_model.addConstr(new_expr == constr.RHS, name=new_constr_name)
+
+                        track_elements['constraints'][new_constr_name] = 'created'
+                        canonical_model.remove(constr)
+                        track_elements['constraints'][constr.ConstrName] = 'removed'
+
+            canonical_model.remove(var)
+            track_elements['variables'][var.VarName] = 'removed'
+            track_elements['variables'][f"{var.VarName}_pos"] = {'type': 'created', 'original_var': var.VarName}
+            track_elements['variables'][f"{var.VarName}_neg"] = {'type': 'created', 'original_var': var.VarName}
+
+    canonical_model.update()
+
+    return canonical_model, track_elements
+
+
+def find_corresponding_negative_rows_with_indices(A, b):
+    """
+    Identify rows in matrix A that have a corresponding negative row and return the indices of such rows.
+
+    Args:
+    A (csr_matrix): The constraint matrix of the linear problem.
+    b (list): The right-hand side values of the constraints.
+
+    Returns:
+    (np.array, list):
+        - A boolean array indicating rows that have a corresponding negative row.
+        - A list of lists with indices of rows that have negative counterparts, or None if there is no counterpart.
+    """
+    rows, cols = A.A.shape
+    has_negative_counterpart = np.zeros(rows, dtype=bool)
+    indices_list = [None] * rows  # Initialize with None
+
+    for i in range(rows):
+        if has_negative_counterpart[i]:  # Skip if already matched
+            continue
+        for j in range(i + 1, rows):  # Avoid comparing the row with itself and repeat comparisons
+            # Check if A[j, :] is the negative of A[i, :] and b[j] is the negative of b[i]
+            if np.allclose(A.A[i, :], -A.A[j, :]) and np.isclose(b[i], -b[j]):
+                has_negative_counterpart[i] = True
+                has_negative_counterpart[j] = True
+                # Store indices of rows that are negatives of each other
+                indices_list[i] = j
+                indices_list[j] = i
+
+    # Replace unmodified None with empty lists or keep it as per requirement
+    indices_list = [indices if indices is not None else None for indices in indices_list]
+
+    return has_negative_counterpart, indices_list
+
+
+def linear_dependency(A, feasibility_tolerance=0.01):
+    """
+    This function checks for linear dependency among the rows of matrix A.
+
+    Linear dependency is checked through division of corresponding row elements.
+    If the division of any corresponding row elements across two rows has very little variation,
+    it indicates a row is linearly dependent on the other.
+
+    Parameters:
+    - A: numpy.ndarray or scipy sparse matrix, matrix of coefficients of the linear constraints.
+    - feasibility_tolerance: float, the tolerance limit under which two constrained row values
+                             are considered the same (indicating low variety, hence, dependence).
+
+    Returns:
+    - vector_index: list of tuple, the recorded pairs of indices of rows that were compared
+                    and found to have equal implications of each other's space.
+    - any_dependency: bool, True if there is at least one set of rows in A that are
+                      linearly dependent within the threshold; False otherwise.
+    """
+
+    # Convert sparse matrix to dense if necessary.
+    if issparse(A):
+        A = A.toarray()
+
+    m, n = A.shape
+    dependent_rows = [[] for _ in range(m)]  # Initialize with empty lists
+    has_linear_dependency = np.zeros(m, dtype=bool)
+
+    for i in range(m):
+        for j in range(i + 1, m):
+            with np.errstate(divide='ignore', invalid='ignore'):
+                # Perform row element division, safety check for division by 0
+                is_nonzero = (A[j, :] != 0)
+                div = np.where(is_nonzero, A[i, :] / A[j, :], np.inf)
+                div_filtered = div[np.isfinite(div)]
+
+                if len(div_filtered) > 0:
+                    # Choose an element with a real value for comparison
+                    div_with_value = div_filtered[0]
+                    # Check if the differences are within the tolerance
+                    close_enough = np.all(np.abs(div_filtered - div_with_value) < feasibility_tolerance)
+                    if close_enough:
+                        has_linear_dependency[i] = True
+                        dependent_rows[i].append(j)
+                        dependent_rows[j].append(i)
+
+    return dependent_rows, has_linear_dependency
+
+
+def model_stats(model):
+    """
+    Calculates the number of variables and constraints in a Gurobi model.
+
+    Parameters:
+    - model: Gurobi Model object, the optimization model from which to calculate the stats.
+
+    Returns:
+    - n_var: int, the number of variables in the model.
+    - n_const: int, the number of constraints in the model.
+    """
+    n_var = model.numVars
+    n_const = model.numConstrs
+    return n_var, n_const
