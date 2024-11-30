@@ -6,8 +6,8 @@ import sys
 
 from datetime import datetime
 
-from Interpretable_Optimization.models.utils_models.presolve_class import PresolveComillas
-from Interpretable_Optimization.models.utils_models.utils_functions import create_original_model, get_model_matrices, \
+from utils_models.presolve_class import PresolveComillas
+from utils_models.utils_functions import create_original_model, get_model_matrices, \
     save_json, build_model_from_json, compare_models, normalize_features, matrix_sparsification, \
     sparsification_sensitivity_analysis, build_dual_model_from_json, \
     constraint_distance_reduction_sensitivity_analysis, pre_processing_model, constraint_reduction, \
@@ -15,7 +15,7 @@ from Interpretable_Optimization.models.utils_models.utils_functions import creat
     measuring_constraint_infeasibility, quality_check, sparsification_test, constraint_reduction_test, get_info_GAMS, \
     detailed_info_models, rhs_sensitivity, cost_function_sensitivity, dict2json, canonical_form, nested_dict
 
-from Interpretable_Optimization.models.utils_models.utils_presolve import get_row_activities, \
+from models.utils_models.utils_presolve import get_row_activities, \
     eliminate_implied_bounds, small_coefficient_reduction, eliminate_zero_columns, \
     eliminate_singleton_equalities, eliminate_zero_rows, eliminate_doubleton_equalities, eliminate_kton_equalities, \
     eliminate_singleton_inequalities, eliminate_dual_singleton_inequalities, eliminate_redundant_columns, \

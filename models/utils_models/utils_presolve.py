@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.sparse import csr_matrix
-from Interpretable_Optimization.models.utils_models.utils_functions import get_model_matrices, save_json, \
+from models.utils_models.utils_functions import get_model_matrices, save_json, \
     build_model_from_json, find_corresponding_negative_rows_with_indices, canonical_form, linear_dependency
 from collections import defaultdict
 
